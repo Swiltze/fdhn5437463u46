@@ -60,13 +60,22 @@ const db = new sqlite3.Database('./db/chatdb.sqlite', (err) => {
 });
 
 function isAdmin(req, res, next) {
-  if (req.session.role === 'admin') {
-    next();
+  const userId = req.session.userId;
+  if (userId) {
+    db.get(`SELECT role FROM users WHERE id = ?`, userId, (err, row) => {
+      if (err) {
+        console.error(err);
+        res.sendStatus(500);
+      }
+      if (row && row.role === 'admin') {
+        return next();
+      }
+      return res.sendStatus(403);
+    });
   } else {
-    res.status(403).send('Access Denied Idiot');
+    return res.sendStatus(401);
   }
-};
-
+}
 
 // Routes
 app.get('/', (req, res) => {
@@ -92,18 +101,21 @@ app.post('/register', (req, res) => {
   // U like hash? 
   bcrypt.hash(password, saltRounds, (err, hash) => {
     if (err) {
-      console.error(err)
+      console.error(err);
       res.redirect('/');
     } else {
-  db.run('INSERT INTO users (username, password) VALUES (?, ?)', [username, hash], function(err) {
-    if (err) {
-      res.redirect('/');
+      db.run('INSERT INTO users (username, password) VALUES (?, ?)', [username, hash], function (err) {
+        if (err) {
+          res.redirect('/');
         } else {
           req.session.userId = this.lastID;
           res.redirect('/chat');
-        });
+        }
       });
+    }
   });
+});
+
 
 
 app.post('/login', async (req, res) => {
@@ -165,6 +177,21 @@ app.post('/logout', (req, res) => {
   res.redirect('/');
 });
 
+//delete msg
+app.post('/delete-message', isAdmin, (req, res) => {
+  const messageId = req.body.messageId;
+  db.run('DELETE FROM messages WHERE id = ?', [messageId], (err) => {
+    if (err) {
+      console.error(err);
+      return res.sendStatus(500).send('Error deleting message');
+    } else {
+      io.emit('deleteMessage', messageId);
+      res.status(200).send('Message deleted');
+    }
+    res.sendStatus(200);
+  });
+});
+
 app.post('/ban-user', isAdmin, (req, res) => {
   const { userId } = req.body;
   let { reason } = req.body;
@@ -204,7 +231,7 @@ io.on('connection', (socket) => {
   const userSockets = {};
   
   let username;
-
+  
   // Fetch the username from the database
   db.get('SELECT username FROM users WHERE id = ?', [userId], (err, row) => {
     if (err) {
@@ -229,65 +256,78 @@ io.on('connection', (socket) => {
 
   // ... other code ...
 
-socket.on('chatMessage', (msg) => {
-  // Check if the message is a ban command
-  if (msg.startsWith('/ban ')) {
-    // Split the message to extract the username and reason
+  socket.on('chatMessage', (msg) => {
     const parts = msg.split(' ');
-    if (parts.length >= 3) {
-      const targetUsername = parts[1];
-      const reason = parts.slice(2).join(' ');
-
-      // Check if the user has admin privileges
+    const command = parts[0];
+    const targetUsername = parts[1];
+  
+    // Helper function to check admin privileges
+    const checkAdminPrivileges = (callback) => {
       db.get('SELECT role FROM users WHERE id = ?', [userId], (err, row) => {
         if (err) {
           console.error(err);
           return;
         }
         if (row && row.role === 'admin') {
-          // Perform the ban operation
-          db.run('INSERT INTO banned_users (user_id, reason) SELECT id, ? FROM users WHERE username = ?', [reason, targetUsername], function(err) {
-            if (err) {
-              console.error(err);
-              return;
-            }
-            if (this.changes > 0) {
-              console.log(`User ${targetUsername} has been banned by ${username} for: ${reason}`);
-              // tell everyone they got banned so they can be shunned. 
-              socket.broadcast.emit('userBanned', `User ${targetUsername} because they ${reason}`);
-            } else {
-              // Emit a message if the target user does not exist
-              socket.emit('banError', `User ${targetUsername} does not exist or is already banned.`);
-            }
-          });
+          callback();
         } else {
-          // Emit a message if the user does not have admin privileges
-          socket.emit('banError', 'You do not have permission to ban users.');
+          socket.emit('adminError', 'You do not have permission to perform this action.');
         }
       });
+    };
+  
+    if (command === '/ban' && parts.length >= 3) {
+      const reason = parts.slice(2).join(' ');
+      checkAdminPrivileges(() => {
+        // Perform the ban operation
+        db.run('INSERT INTO banned_users (user_id, reason) SELECT id, ? FROM users WHERE username = ?', [reason, targetUsername], function(err) {
+          if (err) {
+            console.error(err);
+            return;
+          }
+          if (this.changes > 0) {
+            console.log(`User ${targetUsername} has been banned for: ${reason}`);
+            socket.broadcast.emit('userBanned', `User ${targetUsername} has been banned for: ${reason}`);
+          } else {
+            socket.emit('banError', `User ${targetUsername} does not exist or is already banned.`);
+          }
+        });
+      });
+    } else if (command === '/unban' && parts.length >= 2) {
+      checkAdminPrivileges(() => {
+        // Perform the unban operation
+        db.run('DELETE FROM banned_users WHERE user_id = (SELECT id FROM users WHERE username = ?)', [targetUsername], function(err) {
+          if (err) {
+            console.error(err);
+            return;
+          }
+          if (this.changes > 0) {
+            console.log(`User ${targetUsername} has been unbanned.`);
+            socket.emit('unbanSuccess', `User ${targetUsername} has been unbanned.`);
+          } else {
+            socket.emit('unbanError', `User ${targetUsername} does not exist or is not banned.`);
+          }
+        });
+      });
     } else {
-      // Emit a message if the command format is incorrect
-      socket.emit('banError', 'Usage: /ban username reason');
-    }
-  } else {
-    // Normal chat message handling
-    db.get('SELECT username FROM users WHERE id = ?', [userId], (err, row) => {
-      if (err) {
-        console.error(err);
-        return;
-      }
-      const username = row.username;
-      db.run('INSERT INTO messages (user_id, message) VALUES (?, ?)', [userId, msg], function(err) {
+      // Normal chat message handling
+      db.get('SELECT username FROM users WHERE id = ?', [userId], (err, row) => {
         if (err) {
           console.error(err);
           return;
         }
-        io.emit('chatMessage', { username, message: msg, timestamp: new Date() });
+        const username = row.username;
+        db.run('INSERT INTO messages (user_id, message) VALUES (?, ?)', [userId, msg], function(err) {
+          if (err) {
+            console.error(err);
+            return;
+          }
+          io.emit('chatMessage', { username, message: msg, timestamp: new Date() });
+        });
       });
-    });
-  }
-});
-
+    }
+  });
+  
 // ... rest of your server.js code ...
 
 
