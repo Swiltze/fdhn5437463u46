@@ -7,6 +7,7 @@ const session = require('express-session');
 const sharedsession = require('express-socket.io-session');
 const bcrypt = require('bcrypt');
 const saltRounds = 10;
+const validator = require('validator');
 
 // Set up session middleware
 const sessionMiddleware= session({
@@ -74,6 +75,20 @@ app.get('/', (req, res) => {
 
 app.post('/register', (req, res) => {
   const { username, password } = req.body;
+  // sanitize shit ig some lengths for username would b good
+  username = validator.trim(username);
+  username= validator.escape(username);
+  if (!validator.isLength(username, { min: 3, max: 20 })) {
+    return res.redirect('/?error=invalidusername');
+  }
+  //password requirements no weak shit allowed
+  const passwordRequirements = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])[A-Za-z\d@$!%*?&]{8,}$/;
+   // Check if the password meets the requirements
+  if (!passwordRequirements.test(password)) {
+    // If not, redirect and inform the user
+    return res.redirect('/?error=invalidpassword');
+  }
+
   // U like hash? 
   bcrypt.hash(password, saltRounds, (err, hash) => {
     if (err) {
@@ -86,11 +101,10 @@ app.post('/register', (req, res) => {
         } else {
           req.session.userId = this.lastID;
           res.redirect('/chat');
-        }
+        });
       });
-    }
   });
-});
+
 
 app.post('/login', async (req, res) => {
   const { username, password } = req.body;
@@ -152,7 +166,11 @@ app.post('/logout', (req, res) => {
 });
 
 app.post('/ban-user', isAdmin, (req, res) => {
-  const { userId, reason } = req.body;
+  const { userId } = req.body;
+  let { reason } = req.body;
+
+  reason = validator.escape(reason);
+
   db.run('INSERT INTO banned_users (user_id, reason) VALUES (?, ?)', [userId, reason], (err) => {
     if (err) {
       console.error(err);
