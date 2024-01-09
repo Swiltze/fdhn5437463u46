@@ -10,7 +10,7 @@ const saltRounds = 10;
 const validator = require('validator');
 
 // Set up session middleware
-const sessionMiddleware= session({
+const sessionMiddleware = session({
   secret: 'secret key',
   resave: false,
   saveUninitialized: false,
@@ -30,7 +30,9 @@ app.use(express.static('public'));
 
 // Body parser middleware to parse form data
 app.use(express.urlencoded({ extended: true }));
+app.use(express.json()); // To parse JSON bodies
 
+// Initialize SQLite database
 // Initialize SQLite database
 const db = new sqlite3.Database('./db/chatdb.sqlite', (err) => {
   if (err) {
@@ -121,48 +123,50 @@ app.post('/register', (req, res) => {
 app.post('/login', async (req, res) => {
   const { username, password } = req.body;
   
-  // Check if user exists in user table
-  db.get('SELECT id, password FROM users WHERE username = ?', [username], async (err, row) => {
+  // Check if the user exists in the users table
+  db.get('SELECT id, password FROM users WHERE username = ?', [username], async (err, userRow) => {
     if (err) {
-      console.error(err);
-      return res.redirect('/');
-    // who the fuck r u?   
-    } if (!row) {
-      return res.redirect('/?error=nonexistantuser');
+      console.error('Database error:', err);
+      return res.redirect('/?error=databaseerror');
     }
-  // do the user exist? yes? check if the fucker is banned  
-  db.get('SELECT user_id FROM banned_users WHERE user_id = ?', [row.id], async (err, bannedRow) => {
-    if (err) {
-      console.error(err);
-      return res.redirect('/');
+
+    // If the user does not exist
+    if (!userRow) {
+      return res.redirect('/?error=usernotfound');
     }
-    //are they banned?    
-    if(bannedRow) {
-      console.log(`${username} is banned for ${bannedRow.reason}`);
-      return res.redirect('/banned');
-    }
-    // no? good boy!! check if the password is correct
-    bcrypt.compare(password, row.password, (err, result) => {
+
+    // Check if the user is banned
+    db.get('SELECT user_id, reason FROM banned_users WHERE user_id = ?', [userRow.id], async (err, bannedRow) => {
       if (err) {
-        console.error(err);
-        return res.redirect('/');
+        console.error('Database error:', err);
+        return res.redirect('/?error=databaseerror');
       }
-      //yes?
-      if (result) {
-        req.session.userId = row.id;
-        res.redirect('/chat');
-      } else {
-        //nooooooo!!!
-        res.redirect('/?error=wrongpassword');
+
+      // If the user is banned
+      if (bannedRow) {
+        console.log(`User ${username} is banned for reason: ${bannedRow.reason}`);
+        return res.redirect('/?error=banned');
       }
+
+      // Check if the password is correct
+      bcrypt.compare(password, userRow.password, (err, result) => {
+        if (err) {
+          console.error('Bcrypt error:', err);
+          return res.redirect('/?error=bcrypterror');
+        }
+
+        // If the password is correct
+        if (result) {
+          req.session.userId = userRow.id;
+          res.redirect('/chat');
+        } else {
+          // If the password is incorrect
+          res.redirect('/?error=invalidpassword');
+        }
+      });
     });
   });
 });
-});
-
-
-
-
 
 app.get('/chat', (req, res) => {
   if (req.session.userId) {
@@ -177,61 +181,47 @@ app.post('/logout', (req, res) => {
   res.redirect('/');
 });
 
-//delete msg
+// Admin routes
+app.post('/ban-user', isAdmin, (req, res) => {
+  const { userId, reason } = req.body;
+
+  // Escape the reason for security
+  const escapedReason = validator.escape(reason);
+
+  // Insert into banned_users table
+  db.run('INSERT INTO banned_users (user_id, reason) VALUES (?, ?)', [userId, escapedReason], (err) => {
+    if (err) {
+      console.error(err);
+      return res.status(500).send('Error banning user');
+    } else {
+      io.emit('banUser', { userId, reason: escapedReason });
+      res.status(200).send('User banned');
+    }
+  });
+});
+
 app.post('/delete-message', isAdmin, (req, res) => {
-  const messageId = req.body.messageId;
+  const { messageId } = req.body;
+
+  // Delete the message from the messages table
   db.run('DELETE FROM messages WHERE id = ?', [messageId], (err) => {
     if (err) {
       console.error(err);
-      return res.sendStatus(500).send('Error deleting message');
+      return res.status(500).send('Error deleting message');
     } else {
       io.emit('deleteMessage', messageId);
       res.status(200).send('Message deleted');
     }
-    res.sendStatus(200);
   });
 });
 
-app.post('/ban-user', isAdmin, (req, res) => {
-  const { userId } = req.body;
-  let { reason } = req.body;
-
-  reason = validator.escape(reason);
-
-  db.run('INSERT INTO banned_users (user_id, reason) VALUES (?, ?)', [userId, reason], (err) => {
-    if (err) {
-      console.error(err);
-      return res.sendStatus(500).send('Error banning user');
-    } else {
-      io.emit('banUser', userId);
-      res.status(200).send('User banned');
-    }
-    res.sendStatus(200);
-  });
-});
-
-app.post('/delete-message', isAdmin, (req, res) => {
-  const messageId = req.body.messageId;
-  db.run('DELETE FROM messages WHERE id = ?', [messageId], (err) => {
-    if (err) {
-      console.error(err);
-      return res.sendStatus(500).send('Error deleting message');
-    } else {
-      io.emiter('deleteMessage', messageId);
-      res.status(200).send('Message deleted');
-    }
-  });
-});
-
-
-const userSockets = {};
 io.on('connection', (socket) => {
   // Retrieve the userId from the socket's session
   const userId = socket.handshake.session.userId;
   const userSockets = {};
   
   let username;
-  
+
   // Fetch the username from the database
   db.get('SELECT username FROM users WHERE id = ?', [userId], (err, row) => {
     if (err) {
@@ -342,3 +332,5 @@ const PORT = process.env.PORT || 3000;
 http.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
+
+
